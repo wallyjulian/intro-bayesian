@@ -1,0 +1,235 @@
+---
+title: "ptiks opt"
+author: "L. Odette"
+format: html
+page-layout: full
+toc: true
+editor: visual
+code-fold: true
+code-line-numbers: true
+code-block-border-left: "#31BAE9"
+theme: sandstone
+fontsize: 85%
+self-contained: true
+date: 04/04/2024
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction {.tabset .tabset-fade .tabset-pills}
+
+Optimization is important in many fields, including in data science. In manufacturing, where every decision is critical to the process and the profit of organization, optimization is often employed, from the number of each products produced, how the unit is scheduled for production, get the best or optimal process parameter, and also the routing determination such as the traveling salesman problem. In data science, we are familiar with model tuning, where we tune our model in order to improve the model performance. Optimization algorithm can help us to get a better model performance. 
+
+Bayesian Optimization is one of many optimization algorithm that can be employed to various cases. Bayesian Optimization employ a probabilistic model to optimize the fitness function. The advantage of Bayesian Optimization is when evaluations of the fitness function are expensive to perform — as is the case when it requires training a machine learning algorithm — it is easy to justify some extra computation to make better decisions[^1]. It is best-suited for optimization over continuous domains of less than 20 dimensions, and tolerates stochastic noise in function evaluations[^2].
+
+This post is dedicated to learn how Bayesian Optimization works and their application in various business and data science case. The algorithm will be run in R.
+
+## About
+
+## Learning Objectives
+
+* Learn how Bayesian Optimization works
+* Learn how to apply Bayesian Optimization in business and data science problem
+* Compare Bayesian Optimization with Particle Swarm Optimization
+
+## Library and Setup
+
+```{r message=FALSE, warning=FALSE}
+library(tidymodels)
+library(ranger)
+library(scales)
+library(GA)
+library(pso)
+library(tidyverse)
+library(rBayesianOptimization)
+library(lubridate)
+library(GPfit)
+
+# For Machine Learning
+library(tidytext)
+library(keras)
+library(RVerbalExpressions)
+library(textclean)
+
+options(scipen = 999)
+```
+
+# Bayesian Optimization: Concept
+
+The general procedure when works with Bayesian Optimization is as follows:
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics(here::here("asset/algorithm.png"))
+```
+
+Bayesian Optimization consists of two main components: a Bayesian statistical model for modeling the objective function, and an acquisition function for deciding where to sample next. The Gaussian process is often employed for the statistical model due to its flexibility and tractability.
+
+## Gaussian Process
+
+The model used for approximating the objective function is called surrogate model. Gaussian process is one of them. Whenever we have an unknown value in Bayesian statistics, we suppose that it was drawn at random by nature from some prior probability distribution. Gaussian Process takes this prior distribution to be multivariate normal, with a specific mean vector and covariance matrix. 
+
+The prior distribution on $[f(x_1), f(x_2), ..., f(x_k)]$ is:
+
+$$f(x_{1:k}) \sim \mathcal{N} (\mu_0(x_{1:k}),\  \Sigma_0(x_{1:k}, x_{1:k})) $$
+
+$\mathcal{N}(x,y)$ : Gaussian/Normal random distribution
+
+$\mu_0(x_{i:k})$ : Mean function of each $x_i$. It is common to use $m(x)=0$ as Gaussian Process is flexible enough to model the mean arbitrarily well[^3]
+
+$\Sigma_0(x_{i:k},x_{i:k})$ : Kernel function/covariance function at each pair of $x_i$
+
+Gaussian process also provides a Bayesian posterior probability distribution that describes potential values for $f(x)$ at the candidate point $x$. Each time we observe f at a new point, this posterior distribution is updated. The Gaussian process prior distribution can be converted into posterior distirbution after having some observed some $f$ or $y$ values. 
+
+$$f(x)|f(x_{1:n}) \sim \mathcal{N} (\mu_n(x), \ \sigma_n^2(x))$$
+
+Where:
+
+$$\mu_n(x) = \Sigma_0(x,x_{i:n}) * \Sigma_0(x_{i:n},x_{i:n})^{-1} * (f(x_{1:n})-\mu_0(x_{1:n})) + \mu_0(x)$$
+
+$$\sigma_n^2(x) = \Sigma_0(x,x) - \Sigma_0(x,x_{i:n}) * \Sigma_0(x_{i:n},x_{i:n})^{-1} * \Sigma_0(x_{i:n},x)$$
+
+Below is the example of Gaussian Process posterior over function graph. The blue dot represent the fitness function of 3 sample points. The solid red line represent the estimate of the fitness function while the dashed line represent the Bayesian credible intervals (similar to confidence intervals). 
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics(here::here("asset/gp_posterior.png"))
+```
+
+Let's illustrate the process with `GPfit` package. Suppose I have a function below:
+
+```{r}
+f <- function(x) {
+  f <- (2 * x - 10)^2 * sin(32 * x - 4)
+  return(f)
+}
+```
+
+Create noise-free $f$ for $n_0$ based on 5 points within range of [0,1].
+
+```{r}
+x <- c(0, 1/3, 1/2, 2/3, 1)
+
+eval <- data.frame(x = x, y = f(x)) %>% as.matrix()
+data.frame(x = x, y = f(x)) |> gt::gt() |> gtExtras::gt_theme_espn()
+```
+
+Create a gaussian process with `GP_fit()` with power exponential correlation function. You can also use Matern correlation function `list(type = "matern", nu = 5/2)`[^4].
+
+```{r}
+fit <- GP_fit(X = eval[ , "x"], 
+              Y = eval[ , "y"], 
+              corr = list(type = "exponential", power = 1.95))
+```
+
+After we fitted GP model, we can calculate the expected value $μ(x)$ at each possible value of x and the corresponding uncertainty $σ(x)$. These will be used when computing the acquisition functions over the possible values of x.
+
+```{r}
+x_new <- seq(0, 1, length.out = 100)
+pred <- predict.GP(fit, xnew = data.frame(x = x_new))
+mu <- pred$Y_hat
+sigma <- sqrt(pred$MSE)
+```
+
+We can visualize the result.
+
+```{r}
+ggplot(as.data.frame(eval))+
+  geom_line(data = data.frame(x = x_new, y = mu),
+            aes(x = x, y = y), color = "red", linetype = "dashed")+
+  geom_ribbon(data = data.frame(x = x_new, y_up = mu + sigma, y_low = mu - sigma), 
+              aes(x = x_new, ymax = y_up, ymin = y_low), fill = "skyblue", alpha = 0.5) +
+  geom_point(aes(x,y), size = 2)+
+  theme_minimal() +
+  labs(title = "Gaussian Process Posterior of f(x)",
+       subtitle = "Blue area indicate the credible intervals",
+       y = "f(x)")
+```
+
+## Acquisition Function
+
+Acquisition function is employed to choose which point of $x$ that we will take the sample next. The chosen point is those with the optimum value of acquisition function. The acquisition function calculate the value that would be generated by evaluation of the fitness function at a new point $x$, based on the current posterior distribution over $f$. 
+
+Below is the illustration of the acquisition function value curve. The value is calculated using expected improvement method. Point with the highest value of the acquisition function will be sampled at the next round/iteration.
+
+```{r out.width="80%", echo=FALSE}
+knitr::include_graphics(here::here("asset/acquisition.png"))
+```
+
+There are several choice of acquisition function, such as expected improvement, Gaussian Process upper confidence bound, entropy search, etc. Here we will illustrate the expected improvement function.
+
+$$EI(x) = \left\{
+\begin{array}{ll}
+      (\mu(x) - f(x^+) - \xi) \Phi(Z) + \sigma(x) \phi(Z) & if \ \sigma(x) > 0 \\
+      0 & if \ \sigma(x) = 0 \\
+\end{array} 
+\right. $$
+
+Where
+
+$$Z = \frac{\mu(x) - f(x^+) - \xi}{\sigma(x)}$$
+
+$f(x^+)$ : Best value of $f(x)$ of the sample
+
+$\mu(x)$ : Mean of the GP posterior predictive at $x$
+
+$\sigma(x)$ : Standard deviation of the GP posterior predictive at $x$
+
+$\xi$ : xi(some call epsilon instead). Determines the amount of exploration during optimization and higher ξ values lead to more exploration. A common default value for ξ is 0.01.
+
+$\Phi$ : The cumulative density function (CDF) of the standard normal distribution
+
+$\phi$ : The probability density function (PDF) of the standard normal distribution
+
+Suppose that `y_best` is the best fitness value from the sample
+```{r}
+y_best <- min(eval[,2])
+```
+
+We can use the code below to get the expected improvement value for each x. We will use epsilon value of 0.01.
+
+```{r}
+eps <- 0.01
+ei_calc <- function(m, s) {
+  if (s == 0) {
+    return(0)
+  }
+  Z <- (m - y_best - eps)/s
+  expected_imp <- (m - y_best - eps) * pnorm(Z) + s * dnorm(Z)
+  return(expected_imp)
+}
+
+expected_improvement <- numeric()
+for (i in 1:length(mu)) {
+  expected_improvement[i] <- ei_calc(m = mu[i],s =  sigma[i])
+}
+```
+
+Let's visualize the result. Create `data.frame` for the result and create `exp_best` which consists of x with the highest expected improvement value.
+
+```{r}
+exp_imp <- data.frame(x = x_new,
+                      y = expected_improvement)
+
+exp_best <- exp_imp %>% filter(y == max(y))
+```
+
+We can visualize the result
+
+```{r}
+ggplot(exp_imp, aes(x, y))+
+  geom_line()+
+  geom_ribbon(aes(ymin = 0, ymax = y), fill = "skyblue", alpha = 0.5, color = "white")+ 
+  geom_vline(xintercept = exp_best$x, linetype = "dashed", color = "red")+
+  geom_point(data = exp_best, size = 2)+
+  theme_minimal() +
+  theme(panel.grid = element_blank())+
+  scale_x_continuous(breaks = c(seq(0,1,0.25), round(exp_best$x,2)))+
+  labs(title = "Expected Improvement",
+       subtitle = "x with the highest expected improvement will be evaluated",
+       y = "Expected Improvement")
+```
+
+With these basic steps, we are ready to apply Bayesian Optimization.
+
+
